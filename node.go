@@ -34,22 +34,6 @@ func (b boundNodeCPPN) QueryNode(x, y float64) []float64 {
 	return b.cppn.ComputeNode(x, y, b.bias, b.networkType)
 }
 
-// SelfQuery adapts a connection CPPN into a NodeCPPN by querying it at the
-// node's own position as both source and target: Compute(x, y, x, y, ...). This
-// shares one genome between connection and node values, but couples a node's
-// values to its self-connection, which is queried at the same point.
-type SelfQuery struct {
-	CPPN CPPN
-}
-
-func (s SelfQuery) ComputeNode(x, y, bias float64, networkType int) []float64 {
-	return s.CPPN.Compute(x, y, x, y, bias, networkType)
-}
-
-func (s SelfQuery) GetOutputSize() int {
-	return s.CPPN.GetOutputSize()
-}
-
 // NodeKind says what role a node plays in the network.
 type NodeKind int
 
@@ -75,18 +59,15 @@ func (k NodeKind) String() string {
 // outputs at (x, y).
 type SpacialNode struct {
 	x, y   float64
-	kind   NodeKind
 	values []float64
 }
 
-// NewSpacialNode creates a node of the given kind at (x, y) and fills its
-// values from ncppn.
-func NewSpacialNode(x, y float64, kind NodeKind, ncppn NodeQuery) *SpacialNode {
+// NewSpacialNode creates a node at (x, y) and fills its values from ncppn.
+func NewSpacialNode(x, y float64, ncppn NodeQuery) *SpacialNode {
 	out := ncppn.QueryNode(x, y)
 	return &SpacialNode{
 		x:      x,
 		y:      y,
-		kind:   kind,
 		values: append([]float64(nil), out...),
 	}
 }

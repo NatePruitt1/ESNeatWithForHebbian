@@ -15,8 +15,8 @@ const (
 	Gaussion ActivationFuncID = 4
 
 	// The functions below are for CPPNs. Substrate nodes cannot choose them
-	// (see ActivationFuncCount), but networks built directly, such as dense
-	// CPPN networks, can use them.
+	// (see ActivationFuncCount), but networks built directly, such as CPPN
+	// networks, can use them.
 	Sine ActivationFuncID = 5
 	Abs  ActivationFuncID = 6
 	Sign ActivationFuncID = 7

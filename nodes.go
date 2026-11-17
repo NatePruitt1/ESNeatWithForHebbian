@@ -29,7 +29,7 @@ func buildRow(n int, y float64, kind NodeKind, ncppn NodeQuery) ([]*SpacialNode,
 	}
 	nodes := make([]*SpacialNode, n)
 	for i, x := range evenlySpaced(n) {
-		nodes[i] = NewSpacialNode(x, y, kind, ncppn)
+		nodes[i] = NewSpacialNode(x, y, ncppn)
 	}
 	return nodes, nil
 }
@@ -79,7 +79,7 @@ func (h *HiddenNodes) Add(x, y float64) (node *SpacialNode, added bool) {
 	if n, ok := h.byPos[position{x, y}]; ok {
 		return n, false
 	}
-	n := NewSpacialNode(x, y, HiddenNode, h.ncppn)
+	n := NewSpacialNode(x, y, h.ncppn)
 	h.byPos[position{x, y}] = n
 	h.order = append(h.order, n)
 	return n, true
