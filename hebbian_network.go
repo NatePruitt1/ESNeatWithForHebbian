@@ -5,244 +5,121 @@ import (
 	"math"
 )
 
-// HebbianNode is a neuron in a HebbianNetwork.
-//
-// Current is the activation from the most recent Compute call and Previous is
-// the one from the call before it. Forward connections read Current (their
-// source has already been computed in this call); recurrent connections read
-// Previous, which gives every recurrent connection exactly one call of delay.
-type HebbianNode struct {
-	Current, Previous float64
-	PreSum            float64
-	Activation        ActivationFuncID
-
-	incoming []int // indices into HebbianNetwork.Connections; built by NewHebbianNetwork
-}
-
-type HebbianConnection struct {
-	From, To                   int
-	A, B, C, D, Eta, W, M, Dir float64
-	Forward                    bool
-}
-
-// HebbianNetwork evaluates nodes in the same layout as AbstractNetwork: the
-// first InputCount nodes are inputs, the next OutputCount are outputs, and the
-// rest are hidden nodes sorted by increasing y. Each Compute call evaluates
-// inputs, then hidden nodes in index order, then outputs, which computes every
-// node after all of its forward sources.
+// HebbianNetwork is a Network whose weights change with the ABCD Hebbian rule.
+// It evaluates exactly like a Network (Compute, Reset and the layout rules are
+// the embedded Network's) and only adds per-connection plasticity:
+// Plasticity[i] belongs to Connections[i]. Recurrent connections are always
+// allowed.
 type HebbianNetwork struct {
-	InputCount, OutputCount int
-	Nodes                   []HebbianNode
-	Connections             []HebbianConnection
+	Network
+	Plasticity []Plasticity
 }
 
-func NewHebbianNode(activation ActivationFuncID) HebbianNode {
-	return HebbianNode{
-		Current:    0.0,
-		Previous:   0.0,
-		Activation: activation,
-		PreSum:     0.0,
-		incoming:   make([]int, 0),
-	}
+// Plasticity holds one connection's Hebbian parameters. The connection's
+// weight is M * Dir: M is a non-negative magnitude that learning changes, and
+// Dir (exactly -1 or +1) fixes the weight's sign.
+//
+//	ΔM = Eta * fitness * (A*pre*post + B*pre + C*post + D)
+//
+// Anti-Hebbian learning comes from negative fitness and Dir = -1, never from a
+// negative Eta.
+type Plasticity struct {
+	A, B, C, D float64
+	Eta        float64
+	M          float64
+	Dir        float64
 }
 
-// NewHebbianConnection creates a connection From -> To with Hebbian
-// coefficients A, B, C, D and learning rate Eta. M_0 is the initial magnitude
-// M, and the starting weight follows the same rule UpdateWeights uses:
-// W = M * Dir.
-func NewHebbianConnection(To, From int, A, B, C, D, Eta, M_0, Dir float64, forward bool) HebbianConnection {
-	return HebbianConnection{
-		From:    From,
-		To:      To,
-		A:       A,
-		B:       B,
-		C:       C,
-		D:       D,
-		Eta:     Eta,
-		M:       M_0,
-		Dir:     Dir,
-		W:       M_0 * Dir,
-		Forward: forward,
-	}
+// Weight returns the connection weight these parameters give.
+func (p Plasticity) Weight() float64 {
+	return p.M * p.Dir
 }
-
-// HebbianValueCount is the number of connection-CPPN outputs a Hebbian
-// conversion reads: indices WeightIndex through EtaIndex in cppn.go.
-const HebbianValueCount = EtaIndex + 1
 
 // Validate checks the rules the connection CPPN is expected to enforce through
 // its structure, so a CPPN that breaks them is caught when the network is
 // built instead of producing a network that silently misbehaves:
 //
 //   - every value is finite (no NaN or ±Inf);
-//   - M >= 0, since UpdateWeights keeps M non-negative and the sign of the
-//     weight comes only from Dir;
-//   - Dir is exactly -1 or +1, so it sets the weight's sign without scaling it;
-//   - Eta >= 0: anti-Hebbian learning comes from negative fitness and
-//     Dir = -1, so a negative learning rate would only add a second,
-//     confusing sign flip;
-//   - W == M * Dir, the relation UpdateWeights maintains.
-func (c HebbianConnection) Validate() error {
+//   - M >= 0, since learning keeps M non-negative;
+//   - Dir is exactly -1 or +1;
+//   - Eta >= 0.
+func (p Plasticity) Validate() error {
 	for _, v := range []struct {
 		name  string
 		value float64
-	}{{"A", c.A}, {"B", c.B}, {"C", c.C}, {"D", c.D}, {"Eta", c.Eta}, {"M", c.M}, {"Dir", c.Dir}, {"W", c.W}} {
+	}{{"A", p.A}, {"B", p.B}, {"C", p.C}, {"D", p.D}, {"Eta", p.Eta}, {"M", p.M}, {"Dir", p.Dir}} {
 		if math.IsNaN(v.value) || math.IsInf(v.value, 0) {
 			return fmt.Errorf("%s is %g; it must be finite", v.name, v.value)
 		}
 	}
-	if c.M < 0 {
-		return fmt.Errorf("M is %g; it must be >= 0", c.M)
+	if p.M < 0 {
+		return fmt.Errorf("M is %g; it must be >= 0", p.M)
 	}
-	if c.Dir != -1 && c.Dir != 1 {
-		return fmt.Errorf("Dir is %g; it must be exactly -1 or +1", c.Dir)
+	if p.Dir != -1 && p.Dir != 1 {
+		return fmt.Errorf("Dir is %g; it must be exactly -1 or +1", p.Dir)
 	}
-	if c.Eta < 0 {
-		return fmt.Errorf("Eta is %g; it must be >= 0", c.Eta)
-	}
-	if c.W != c.M*c.Dir {
-		return fmt.Errorf("W is %g but M * Dir is %g", c.W, c.M*c.Dir)
+	if p.Eta < 0 {
+		return fmt.Errorf("Eta is %g; it must be >= 0", p.Eta)
 	}
 	return nil
 }
 
-func (an *AbstractNetwork) ConvertToHebbian(inputCount, outputCount int) (*HebbianNetwork, error) {
-	// Turn all of the abstract nodes into hebbian nodes.
-	// Turn all of the abstract connections into hebbian connections. This involves bringing values
-	// From a generic float slice to the actual variables.
-
-	// The float slice values (which has M_0 at 0) are defined in cppn.go
-	nodes := make([]HebbianNode, len(an.Nodes))
-	for n, anode := range an.Nodes {
-		nodes[n] = NewHebbianNode(anode.ActivationFunc)
+// NewHebbianNetwork builds a HebbianNetwork. plasticity must have one entry
+// per connection, and each entry must pass Validate. Every connection's Weight
+// is set from its plasticity (M * Dir), so the Weight fields passed in are
+// ignored.
+func NewHebbianNetwork(inputCount, outputCount int, nodes []Node, connections []Connection, plasticity []Plasticity) (*HebbianNetwork, error) {
+	if len(plasticity) != len(connections) {
+		return nil, fmt.Errorf("got %d plasticity entries for %d connections", len(plasticity), len(connections))
 	}
-
-	connections := make([]HebbianConnection, len(an.Connections))
-	for c, aconn := range an.Connections {
-		if len(aconn.Values) < HebbianValueCount {
-			return nil, fmt.Errorf("connection %d has %d CPPN values; Hebbian conversion needs %d", c, len(aconn.Values), HebbianValueCount)
+	for i, p := range plasticity {
+		if err := p.Validate(); err != nil {
+			return nil, fmt.Errorf("connection %d (node %d -> %d): %w", i, connections[i].From, connections[i].To, err)
 		}
-		connections[c] = NewHebbianConnection(aconn.To, aconn.From,
-			aconn.Values[AIndex],
-			aconn.Values[BIndex],
-			aconn.Values[CIndex],
-			aconn.Values[DIndex],
-			aconn.Values[EtaIndex],
-			math.Abs(aconn.Weight), // M_0
-			aconn.Values[DirIndex], // Dir
-			aconn.Forward)
-		if err := connections[c].Validate(); err != nil {
-			return nil, fmt.Errorf("connection %d (node %d -> %d): %w", c, aconn.From, aconn.To, err)
-		}
+		connections[i].Weight = p.Weight()
 	}
-
-	return NewHebbianNetwork(inputCount, outputCount, nodes, connections)
-}
-
-// NewHebbianNetwork creates a network and builds each node's list of incoming
-// connections, so Compute does not have to search the connection list. All
-// activations start at 0. It returns an error naming the first layout rule a
-// connection breaks (see layout.go); recurrent connections are always allowed.
-func NewHebbianNetwork(inputCount, outputCount int, nodes []HebbianNode, connections []HebbianConnection) (*HebbianNetwork, error) {
-	links := make([]link, len(connections))
-	for i, c := range connections {
-		links[i] = link{c.From, c.To, c.Forward}
-	}
-	if err := validateLayout(len(nodes), inputCount, outputCount, links, true); err != nil {
+	net, err := NewNetwork(inputCount, outputCount, nodes, connections, true)
+	if err != nil {
 		return nil, err
 	}
-	hn := &HebbianNetwork{
-		InputCount:  inputCount,
-		OutputCount: outputCount,
-		Nodes:       nodes,
-		Connections: connections,
-	}
-	for i := range hn.Nodes {
-		hn.Nodes[i].incoming = nil
-	}
-	for ci, c := range hn.Connections {
-		hn.Nodes[c.To].incoming = append(hn.Nodes[c.To].incoming, ci)
-	}
-	hn.Reset()
-	return hn, nil
+	return &HebbianNetwork{Network: *net, Plasticity: plasticity}, nil
 }
 
-// Reset sets every activation to 0. Call it between episodes, or before each
-// input in one-shot tasks so that only forward paths affect the output.
-func (hn *HebbianNetwork) Reset() {
-	for i := range hn.Nodes {
-		hn.Nodes[i].Current, hn.Nodes[i].Previous, hn.Nodes[i].PreSum = 0, 0, 0
-	}
-}
-
-// UpdateWeights applies the ABCD Hebbian rule to every connection, using the
-// activations from the most recent Compute call:
-//
-//	ΔM = Eta * fitness * (A*pre*post + B*pre + C*post + D)
-//
-// M is kept non-negative and the weight becomes W = M * d.
-func (hn *HebbianNetwork) UpdateWeights(fitness float64) {
-	for c := range hn.Connections {
-		conn := &hn.Connections[c]
-		pre := hn.Nodes[conn.From].Current
-		post := hn.Nodes[conn.To].Current
-
-		delM := conn.Eta * fitness * (conn.A*pre*post +
-			conn.B*pre +
-			conn.C*post +
-			conn.D)
-
-		conn.M = max(0, conn.M+delM)
-		conn.W = conn.M * conn.Dir
-	}
-}
-
-// Compute runs one step of the network and returns the output activations.
-//
-// Inputs pass through unchanged. Hidden nodes and then outputs are computed
-// in index order; forward connections use their source's value from this
-// step, and recurrent connections (lateral, backward and self-connections)
-// use the value from the previous step. It panics if len(inputs) is not
-// InputCount.
-func (hn *HebbianNetwork) Compute(inputs []float64) []float64 {
-	if len(inputs) != hn.InputCount {
-		panic(fmt.Sprintf("Compute got %d inputs, want %d", len(inputs), hn.InputCount))
-	}
-	for i := range hn.Nodes {
-		hn.Nodes[i].Previous = hn.Nodes[i].Current
-	}
-
-	for i, x := range inputs {
-		hn.Nodes[i].PreSum = x
-		hn.Nodes[i].Current = x
-	}
-
-	for n := hn.InputCount + hn.OutputCount; n < len(hn.Nodes); n++ {
-		hn.computeNode(n)
-	}
-
-	outputs := make([]float64, hn.OutputCount)
-	for o := range outputs {
-		outputs[o] = hn.computeNode(hn.InputCount + o)
-	}
-	return outputs
-}
-
-// computeNode sums node n's weighted inputs, applies its activation function,
-// and stores the result in Current.
-func (hn *HebbianNetwork) computeNode(n int) float64 {
-	node := &hn.Nodes[n]
-	sum := 0.0
-	for _, ci := range node.incoming {
-		c := &hn.Connections[ci]
-		src := &hn.Nodes[c.From]
-		if c.Forward {
-			sum += c.W * src.Current
-		} else {
-			sum += c.W * src.Previous
+// ConvertToHebbian builds a HebbianNetwork, reading each connection's
+// plasticity from its CPPN outputs (see the index constants in cppn.go): the
+// starting magnitude M is |weight|, and Dir, A, B, C, D and Eta come from
+// their own outputs.
+func (an *AbstractNetwork) ConvertToHebbian() (*HebbianNetwork, error) {
+	plasticity := make([]Plasticity, len(an.Connections))
+	for i, c := range an.Connections {
+		if len(c.Values) < HebbianValueCount {
+			return nil, fmt.Errorf("connection %d has %d CPPN values; Hebbian conversion needs %d", i, len(c.Values), HebbianValueCount)
+		}
+		plasticity[i] = Plasticity{
+			A:   c.Values[AIndex],
+			B:   c.Values[BIndex],
+			C:   c.Values[CIndex],
+			D:   c.Values[DIndex],
+			Eta: c.Values[EtaIndex],
+			M:   math.Abs(c.Weight),
+			Dir: c.Values[DirIndex],
 		}
 	}
-	node.PreSum = sum
-	node.Current = node.Activation.Activate(sum)
-	return node.Current
+	return NewHebbianNetwork(an.InputCount, an.OutputCount, an.nodes(), an.connections(), plasticity)
+}
+
+// UpdateWeights applies the Hebbian rule (see Plasticity) to every connection,
+// using the node values from the most recent Compute call, then sets each
+// connection's weight to M * Dir.
+func (hn *HebbianNetwork) UpdateWeights(fitness float64) {
+	for i := range hn.Connections {
+		c := &hn.Connections[i]
+		p := &hn.Plasticity[i]
+		pre := hn.Nodes[c.From].Current
+		post := hn.Nodes[c.To].Current
+
+		dM := p.Eta * fitness * (p.A*pre*post + p.B*pre + p.C*post + p.D)
+		p.M = max(0, p.M+dM)
+		c.Weight = p.Weight()
+	}
 }

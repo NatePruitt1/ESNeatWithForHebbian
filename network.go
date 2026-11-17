@@ -2,57 +2,60 @@ package esneatforhebbians
 
 import "fmt"
 
-// NetworkNode is a neuron in a Network. Its activation is
-// Activation(Bias + sum of weighted inputs). A nil Activation means linear
-// (the identity). Any function works, so a Network can use activation
-// functions beyond ActivationFuncID (sine, absolute value, ...), which is what
-// lets it act as a CPPN.
-type NetworkNode struct {
+// Node is a neuron in a Network. Its value is
+// Activation(Bias + sum of weighted inputs).
+//
+// Current is the value from the most recent step and Previous the one from
+// the step before. Forward connections read Current (their source was already
+// computed this step); recurrent connections read Previous, which gives them
+// exactly one step of delay. PreSum is the most recent sum before the
+// activation function.
+type Node struct {
 	Bias       float64
-	Activation func(float64) float64
+	Activation ActivationFuncID
 
-	// Current is the activation from the most recent Compute call and Previous
-	// the one from the call before it.
 	Current, Previous float64
+	PreSum            float64
 }
 
-// NetworkConnection is a fixed-weight connection From -> To. A forward
-// connection reads its source's value from the current step; a recurrent one
-// (Forward == false) reads the value from the previous step.
-type NetworkConnection struct {
+// Connection is a weighted connection From -> To between node indices.
+// Forward says whether it reads its source's current value (true) or its
+// previous one (false, recurrent).
+type Connection struct {
 	From, To int
 	Weight   float64
 	Forward  bool
 }
 
-// Network is a fixed-weight neural network that follows the same layout and
-// evaluation rules as HebbianNetwork (see layout.go): nodes are laid out as
-// [inputs..., outputs..., hidden...], and each step evaluates inputs, then
+// Network is the evaluation engine every network uses. Nodes follow the
+// layout rules in layout.go, and each Compute call evaluates inputs, then
 // hidden nodes in index order, then outputs.
 //
 // AllowRecurrent controls whether recurrent connections are permitted. A
 // network used as a CPPN must have it off, so every query depends only on its
 // inputs.
+//
+// HebbianNetwork embeds a Network and only adds plasticity, so everything
+// here applies to it as well.
 type Network struct {
 	InputCount, OutputCount int
 	AllowRecurrent          bool
-	Nodes                   []NetworkNode
-	Connections             []NetworkConnection
+	Nodes                   []Node
+	Connections             []Connection
 
-	incoming [][]int // incoming[n] holds indices into Connections ending at n
+	incoming [][]int // incoming[n]: indices into Connections that end at node n
 }
 
-// NewNetwork checks the layout rules and prepares the network for Compute. It
-// returns an error naming the first rule a connection breaks, including any
-// recurrent connection when allowRecurrent is false. All activations start
-// at 0.
-func NewNetwork(inputCount, outputCount int, nodes []NetworkNode, connections []NetworkConnection, allowRecurrent bool) (*Network, error) {
-	links := make([]link, len(connections))
-	for i, c := range connections {
-		links[i] = link{c.From, c.To, c.Forward}
-	}
-	if err := validateLayout(len(nodes), inputCount, outputCount, links, allowRecurrent); err != nil {
+// NewNetwork checks the layout rules and every node's activation function, and
+// prepares the network for Compute. All values start at 0.
+func NewNetwork(inputCount, outputCount int, nodes []Node, connections []Connection, allowRecurrent bool) (*Network, error) {
+	if err := validateLayout(len(nodes), inputCount, outputCount, connections, allowRecurrent); err != nil {
 		return nil, err
+	}
+	for i, n := range nodes {
+		if !n.Activation.Valid() {
+			return nil, fmt.Errorf("node %d has activation function %d, which is not valid", i, n.Activation)
+		}
 	}
 
 	incoming := make([][]int, len(nodes))
@@ -71,18 +74,16 @@ func NewNetwork(inputCount, outputCount int, nodes []NetworkNode, connections []
 	return net, nil
 }
 
-// Reset sets every activation to 0. Call it between episodes, or before each
-// independent input so that only forward paths affect the output. A network
-// without recurrent connections has no state between steps, so it never needs
-// a reset.
+// Reset sets every value to 0. Call it between episodes, or before each
+// independent input so that only forward paths affect the output.
 func (net *Network) Reset() {
 	for i := range net.Nodes {
-		net.Nodes[i].Current, net.Nodes[i].Previous = 0, 0
+		net.Nodes[i].Current, net.Nodes[i].Previous, net.Nodes[i].PreSum = 0, 0, 0
 	}
 }
 
-// Compute runs one step and returns a new slice with the output activations.
-// It panics if len(inputs) is not InputCount.
+// Compute runs one step and returns a new slice with the output values. It
+// panics if len(inputs) is not InputCount.
 func (net *Network) Compute(inputs []float64) []float64 {
 	out := make([]float64, net.OutputCount)
 	net.computeInto(inputs, out)
@@ -95,12 +96,14 @@ func (net *Network) computeInto(inputs, out []float64) {
 	if len(inputs) != net.InputCount {
 		panic(fmt.Sprintf("Compute got %d inputs, want %d", len(inputs), net.InputCount))
 	}
+	// A network without recurrent connections never reads Previous.
 	if net.AllowRecurrent {
 		for i := range net.Nodes {
 			net.Nodes[i].Previous = net.Nodes[i].Current
 		}
 	}
 	for i, x := range inputs {
+		net.Nodes[i].PreSum = x
 		net.Nodes[i].Current = x
 	}
 	for n := net.InputCount + net.OutputCount; n < len(net.Nodes); n++ {
@@ -124,31 +127,7 @@ func (net *Network) computeNode(n int) float64 {
 			sum += c.Weight * net.Nodes[c.From].Previous
 		}
 	}
-	if node.Activation != nil {
-		sum = node.Activation(sum)
-	}
-	node.Current = sum
-	return sum
-}
-
-// ConvertToNetwork builds a fixed-weight Network from an AbstractNetwork,
-// which already uses the [inputs..., outputs..., hidden...] layout with hidden
-// nodes sorted by y. Each connection keeps its CPPN weight and Forward flag;
-// each node keeps its activation function and gets a bias of 0.
-//
-// If allowRecurrent is false, the abstract network's recurrent connections
-// are left out, giving a purely feed-forward network.
-func (an *AbstractNetwork) ConvertToNetwork(inputCount, outputCount int, allowRecurrent bool) (*Network, error) {
-	nodes := make([]NetworkNode, len(an.Nodes))
-	for i, n := range an.Nodes {
-		nodes[i] = NetworkNode{Activation: n.ActivationFunc.Activate}
-	}
-	connections := make([]NetworkConnection, 0, len(an.Connections))
-	for _, c := range an.Connections {
-		if !c.Forward && !allowRecurrent {
-			continue
-		}
-		connections = append(connections, NetworkConnection{From: c.From, To: c.To, Weight: c.Weight, Forward: c.Forward})
-	}
-	return NewNetwork(inputCount, outputCount, nodes, connections, allowRecurrent)
+	node.PreSum = sum
+	node.Current = node.Activation.Activate(sum)
+	return node.Current
 }

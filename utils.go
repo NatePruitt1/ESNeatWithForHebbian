@@ -2,6 +2,8 @@ package esneatforhebbians
 
 import "cmp"
 
+// Argmax returns the index of the largest element of s (the first one, if
+// several are equal), or -1 if s is empty.
 func Argmax[T cmp.Ordered](s []T) int {
 	if len(s) == 0 {
 		return -1
