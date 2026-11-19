@@ -54,3 +54,11 @@ func (act ActivationFunc) Compute(x float64) float64 {
 
 	panic(fmt.Sprintf("unknown activation function %d", int(act)))
 }
+
+func chooseActivation(values []float64) ActivationFunc {
+	if len(values) < ActivationFunctionCount {
+		panic("Values not long enough to cover all activation functions.")
+	}
+
+	return ActivationFunc(Argmax(values[:ActivationFunctionCount]))
+}

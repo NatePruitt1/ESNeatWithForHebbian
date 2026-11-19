@@ -29,6 +29,79 @@ type NetworkSpec struct {
 	OutputShape      []map[ActivationFunc]bool
 }
 
+type nodeSubstratePair struct {
+	node  Node
+	sNode substrateNode
+}
+
+func ANNFromSubstrate(substrate *substrate) *ArtificialNeuralNet {
+	// convert the nodes.
+	nodes := make([]Node, len(substrate.inputNodes)+len(substrate.outputNodes)+len(substrate.hiddenNodes))
+
+	// We want to make a relation nodes and pointers to their substrateNodes
+	nodeRelation := make([]nodeSubstratePair, len(nodes))
+	for i := 0; i < len(substrate.inputNodes); i += 1 {
+		nodeRelation[i].sNode = substrate.inputNodes[i]
+	}
+
+	for i := 0; i < len(substrate.outputNodes); i += 1 {
+		nodeRelation[i+len(substrate.inputNodes)].sNode = substrate.outputNodes[i]
+	}
+
+	for i := 0; i < len(substrate.hiddenNodes); i += 1 {
+		nodeRelation[i+len(substrate.inputNodes)+len(substrate.outputNodes)].sNode = substrate.hiddenNodes[i]
+	}
+
+	for n := range nodeRelation {
+		convertSubstrateNodeInPair(&nodeRelation[n])
+	}
+
+	connections := make([]Connection, len(substrate.conns))
+
+	// Convert connections by finding the nodes that match the connection.
+	for c := range connections {
+		fromPoint := substrate.conns[c].From
+		toPoint := substrate.conns[c].To
+
+		var fromNode int
+		var toNode int
+		for n := range nodeRelation {
+			if nodeRelation[n].sNode.Point == fromPoint {
+				fromNode = n
+			}
+
+			if nodeRelation[n].sNode.Point == toPoint {
+				toNode = n
+			}
+		}
+
+		newConn := Connection{
+			From:    fromNode,
+			To:      toNode,
+			Weight:  substrate.conns[c].values[WEIGHT_INDEX],
+			Forward: !substrate.conns[c].recurrent,
+		}
+
+		connections[c] = newConn
+	}
+
+	for n := range nodeRelation {
+		nodes[n] = nodeRelation[n].node
+	}
+
+	return &ArtificialNeuralNet{
+		InputCount:  len(substrate.inputNodes),
+		OutputCount: len(substrate.outputNodes),
+		Nodes:       nodes,
+		Connections: connections,
+	}
+}
+
+func convertSubstrateNodeInPair(pair *nodeSubstratePair) {
+	pair.node.Activation = chooseActivation(pair.sNode.values[:ActivationFunctionCount])
+	pair.node.Bias = pair.sNode.values[ActivationFunctionCount]
+}
+
 func (n *ArtificialNeuralNet) Validate(ns NetworkSpec) error {
 	if !ns.RecursiveAllowed {
 		for c := range n.Connections {
